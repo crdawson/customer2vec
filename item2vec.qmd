@@ -1,0 +1,324 @@
+---
+jupyter: python3
+---
+
+# Item2Vec
+In this notebook, we demonstarte how to learn embeddigns for items (products) from transactional data using Word2Vec. Orders are interpreted as sentences and product are interpreted as words.
+
+### Data
+We use an external dataset from the Instacart Market Basket Analysis competition (see `datasets.md/Instacart`). Please download and unzip the dataset to `data` folder before running this notebook.
+
+### References
+1. Barkan O., Koenigstein N. -- Item2Vec: Neural Item Embedding for Collaborative Filtering, 2016
+1. Arora S., Warrier D. -- Decoding Fashion Contexts Using Word Embeddings, 2016
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm_notebook as tqdm
+import numpy as np
+import os
+
+from tabulate import tabulate
+import glob
+from IPython.display import display, HTML
+import multiprocessing as mp
+print('Number of CPU cores:', mp.cpu_count())
+
+from gensim.models import Word2Vec
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from mpl_toolkits.mplot3d import Axes3D
+from sklearn.metrics import pairwise_distances
+
+pd.options.display.max_rows = 20
+pd.set_option('display.max_rows', 500)
+pd.set_option('display.max_columns', 500)
+pd.set_option('display.width', 1000)
+pd.set_option('display.max_colwidth', 200)
+sns.set_style("whitegrid")
+
+
+#
+# Helper functions 
+#
+def to_readable(v):
+    value = round(v,2) if isinstance(v, float) else v
+    if value < 1000:
+        return str(value)
+    elif value < 1000000:
+        return str(round(value/1000,1)) + 'K'
+    elif value >= 1000000:
+        return str(round(value/1000000,1)) + 'M'
+    return value
+
+def print_df(df, rows = 10, print_df_mode='psql'):
+    if print_df_mode == 'psql':
+        print(tabulate(df.head(rows), headers='keys', tablefmt='psql'))
+    else:
+        display(df.head(rows))
+    print(f'{len(df)} rows x {len(df.columns)} columns')
+```
+
+# Step 1: Data Loading and Preview
+
+```{python}
+#| scrolled: true
+DATA_PATH = 'data/instacart'
+files_list = glob.glob(f'{DATA_PATH}/*.csv')
+
+data_dict = {}
+for file in files_list:
+    print(f'\n\nReading: {file}')
+    data = pd.read_csv(file)
+    print(data.info(show_counts=True))
+
+    print(f'\nSample ({file}):')
+    display(HTML(data.sample(min(10, len(data))).to_html()))
+    print(f'\nDataset stats ({file}):')
+    display(HTML(data.describe().T.to_html()))
+    
+    print(f'\nColumn stats ({file}):')
+    for col in data.columns:
+        print(f'\nColumn {col} has {data[col].nunique()} unique values')
+        print(f"Example of values: {data[col].unique()[:10]}")
+
+    data_dict[file.split('/')[-1].split('.')[0]] = data
+    
+data_dict.keys()
+```
+
+# Step 2: Data Preparation
+
+```{python}
+order_product_cnt_ds = data_dict['order_products__prior'].groupby('order_id').count()[['product_id']]
+order_product_cnt_ds.columns = ['product_cnt']
+order_ds = data_dict['orders'].merge(order_product_cnt_ds, left_on='order_id', right_index=True)      # add product counters to orders
+order_ds.sample(5)
+```
+
+```{python}
+total_user = len(order_ds.user_id.unique())
+total_order = len(order_ds)
+total_ordered_product = len(data_dict['order_products__prior'])
+unique_products = len(data_dict['order_products__prior'].product_id.unique())
+
+print("total user = {}".format(to_readable(total_user)))
+print("total order = {} ({} orders per user)".format(to_readable(total_order), to_readable(total_order/total_user) ))
+print("total product = ", to_readable(unique_products))
+print("total ordered product  = {} ({} orders per product)".format(to_readable(total_ordered_product), to_readable(total_ordered_product/unique_products) ))
+```
+
+# Step 3: Prepare a Product Corpus
+
+We now proceed to learning informative semantic representation for items (products) using word2vec model. The first step is to build a product corpus.
+
+```{python}
+merge_order_product_df = data_dict['order_products__prior'].merge(order_ds, on='order_id' )
+
+order_product_df = merge_order_product_df\
+    .sort_values(['user_id','order_id','add_to_cart_order'])[['order_id','product_id', 'add_to_cart_order']]
+
+# Print the input 
+print_df(order_product_df)
+
+print('Creating sequences based on transactions...')
+order_product_list = order_product_df.values.tolist()
+
+# Each entry of a corpus is one order represented by a chronologically sorted sequence of product IDs
+print('Preparing a corpus of items...')
+product_corpus = []     
+sentence = []
+new_order_id = order_product_list[0][0]
+for (order_id, product_id, add_to_cart) in tqdm(order_product_list):
+    if new_order_id != order_id:
+        product_corpus.append(sentence)
+        sentence = []
+        new_order_id = order_id
+    sentence.append(str(product_id))
+```
+
+# Step 4: Train Item2Vec model
+
+To train the model, we use the Word2Vec implementation from Gensim adjusting the following parameters:
+* sentences = product_corpus
+* window - maximum distance between the current and predicted word within a sentence.
+* size - dimensionality of the word vectors.
+* min_count - ignores all words with total frequency lower than this.
+
+```{python}
+TRAIN_ITEM_MODEL = False   # True - create a new model, False - load a previosuly created model
+LOGGING_ELABLED = False
+MODEL_DIR = 'models'
+
+if not os.path.exists(MODEL_DIR):
+    os.makedirs(MODEL_DIR)
+```
+
+```{python}
+if LOGGING_ELABLED:
+    import logging
+    logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.ERROR)
+    
+WORD_DIM = 200
+model_filename = f'models/item2vec.{WORD_DIM}d.model'
+if TRAIN_ITEM_MODEL:
+    model = Word2Vec(product_corpus, 
+                window=5, 
+                vector_size=WORD_DIM, 
+                workers=mp.cpu_count() - 2, 
+                min_count=100)
+    
+    model.save(model_filename)
+    print(f'Model saved to [{model_filename}]')
+    
+else:
+    model = Word2Vec.load(model_filename)
+    print(f'Model loaded from [{model_filename}]')
+```
+
+```{python}
+def to_product_name(id, columns='product_name'):
+    return data_dict['products'][data_dict['products'].product_id==id][columns].values.tolist()[0]
+
+def most_similar_readable(model, product_id, topn=10):
+    similar_list = [(product_id, 1.0)] + model.wv.most_similar(str(product_id), topn=topn)
+    return pd.DataFrame([( to_product_name(int(id)), int(id), similarity ) for (id, similarity) in similar_list],
+                        columns=['product', 'product_id', 'similarity'])
+```
+
+```{python}
+#
+# Reality check: Show the nearest neighbors for several common products 
+#
+for product_id in [13176, 39180, 2326]:
+    print_df(most_similar_readable(model, product_id)) 
+```
+
+# Step 5: Visualize the Semantic Space Using t-SNE
+
+We demonstrate that the semantic space has a meaningful internal structure aligned with the typical product taxonomy (departments and aisles).
+
+```{python}
+#
+# Prepare the embeddings for t-SNE
+#
+word_vectors = model.wv
+ vocab = list(model.wv.key_to_index.keys())
+item2vector_dict = {arg:model.wv[arg] for arg in vocab}
+X = pd.DataFrame(item2vector_dict).T.values
+X.shape, len(vocab), vocab[0]
+```
+
+```{python}
+#
+# Perform t-SNE
+#
+distance_matrix = pairwise_distances(X, X, metric='cosine', n_jobs=-1)
+tsne = TSNE(metric="precomputed", init = "random", n_components=2, verbose=1, perplexity=500, n_iter=1000)
+tsne_results = tsne.fit_transform(distance_matrix)
+```
+
+```{python}
+df_semantic_item = pd.DataFrame({'product_id': vocab})
+df_semantic_item['tsne-2d-one'] = tsne_results[:,0]
+df_semantic_item['tsne-2d-two'] = tsne_results[:,1]
+df_semantic_item['product_id'] = df_semantic_item['product_id'].astype(int)
+
+df_semantic_item = df_semantic_item.merge(data_dict['products'], on='product_id', how='left')
+df_semantic_item = df_semantic_item.merge(data_dict['aisles'], on='aisle_id', how='left')
+df_semantic_item = df_semantic_item.merge(data_dict['departments'], on='department_id', how='left')
+
+print_df(df_semantic_item.sample(5))
+
+n_aisle = df_semantic_item['aisle'].nunique()
+n_department = df_semantic_item['department'].nunique()
+print(f"Unique aisles: {n_aisle}") 
+print(f"Unique departments: {n_department}")
+```
+
+```{python}
+#
+# Visualize the entire semantic space and its mapping to the departments
+#
+df_semantic_item.rename(columns={'department': 'Department'}, inplace=True)
+plt.figure(figsize=(16, 25));
+sns.set_context("paper", font_scale = 2.4);
+sns.set_style({'font.family':'Arial', 'font.serif':['Arial']});
+g = sns.scatterplot(
+    x="tsne-2d-one", y="tsne-2d-two",
+    hue='Department',
+    palette=sns.color_palette("hls", n_department),
+    data=df_semantic_item,
+    legend="full",
+    alpha=0.5
+);
+g.set(xlabel=None);
+g.set(ylabel=None);
+plt.legend(loc='lower right', labelspacing=0.15, ncol=1)
+g.figure.savefig("item_space_tsne.pdf");
+plt.show();
+```
+
+```{python}
+#
+# Visualize the mapping between the semantic space and aisles
+#
+aisle_list = sorted(df_semantic_item['aisle'].unique())
+aisle_set = aisle_list[:20]   # take a subset of aisles to keep it readable
+
+print(f'Products in the selected aisles: {df_semantic_item[df_semantic_item.aisle.isin(aisle_set)].shape[0]}')
+plt.figure(figsize=(16, 25))
+g = sns.scatterplot(
+   x="tsne-2d-one", y="tsne-2d-two",
+   hue='aisle',
+   data=df_semantic_item[df_semantic_item.aisle.isin(aisle_set)],
+   legend="full",
+   alpha=0.5
+)
+g.figure.savefig("aisle_space_tsne.pdf");
+plt.show()
+```
+
+# Step 6: Compare the Original Semantic Space and Its t-SNE Projection
+
+In this section, we compare the original (200 dimensional) semantic space with its t-SNE projection.
+
+We demonstrate that rhe high-dimensional semantic space is better aligned with traditional labels (department, asile) than t-SNE projection. More basic projection methods provide event worse results - the SVD projection below is not aligned with the labels at all. However, the aligment between the traditional labels and semantic space is very weak (negative silhouette scores) anyways. This does not mean that the semantic space has no meanigful structure - the structure is just different from product depertment taxonomy. We study the strucutre in mode detail in Customer2Vec model.  
+
+```{python}
+from sklearn.metrics import silhouette_samples, silhouette_score
+
+for space_name, space in {'TSNE': tsne_results, 'raw latent space': model.wv.vectors}.items():
+    for entity in ['Department', 'aisle']:
+        silhouette_avg = silhouette_score(space, df_semantic_item[entity], metric="cosine")
+        print(f"The number of unique {entity}s is {df_semantic_item[entity].nunique()} " +\
+              f"and the average silhouette_score on {space_name} is : {silhouette_avg:.4}")
+```
+
+```{python}
+from sklearn.decomposition import TruncatedSVD
+svd = TruncatedSVD(n_components=2)
+X_reduced = svd.fit_transform(X)
+
+df_svd = pd.DataFrame({'product_id': vocab})
+df_svd['svd-2d-one'] = X_reduced[:,0]
+df_svd['svd-2d-two'] = X_reduced[:,1]
+df_svd['product_id'] = df_svd['product_id'].astype(int)
+
+df_svd = df_svd.merge(data_dict['products'], on='product_id', how='left')
+df_svd = df_svd.merge(data_dict['aisles'], on='aisle_id', how='left')
+df_svd = df_svd.merge(data_dict['departments'], on='department_id', how='left')
+
+plt.figure(figsize=(8, 8))
+sns.scatterplot(
+        x="svd-2d-one", y="svd-2d-two",
+        hue='department',
+        data=df_svd,
+        legend="full",
+        alpha=0.3
+    )
+plt.show()
+```
+

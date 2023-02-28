@@ -1,0 +1,10 @@
+*.model
+*.npy
+*.pdf
+*.zip
+*.csv
+env
+env/*
+.Rproj.user
+.Rproj.user/*
+.Rhistory
